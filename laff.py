@@ -1,6 +1,7 @@
 from cmd import Cmd
 import matplotlib.pyplot as plt
 from numpy import True_
+from pytest import param
 import laffmodels
 from lmfit import Model, Parameters
 from lmfit.confidence import conf_interval
@@ -349,9 +350,12 @@ Type 'help' or '?' to list commands.
         if inp == 'simplepowerlaw':
             model = Model(laffmodels.powerlaw_simple)
 
+            alph = parameterInput(inp,'index')
+            norm = parameterInput(inp,'norm')
+
             params = Parameters()
-            params.add('alph', value=1, min=0, max=10, vary=True)
-            params.add('norm', value=5, min=1e-8, max=1e+1, vary=True)
+            params.add('alph', value=alph, min=-5, max=5, vary=True)
+            params.add('norm', value=norm, min=1e-32, max=1e+32, vary=True)
 
             result = model.fit(ydata, params, x=xdata)
             print(result.fit_report())
@@ -362,29 +366,37 @@ Type 'help' or '?' to list commands.
         if inp == 'powerlaw':
             model = Model(laffmodels.powerlaw_general)
             
-            # assign parameters
+            # ask user for number of powerlaw breaks
+            try:
+                N = int(input('LAFF:powerlaw:breaks > '))
+            except:
+                print(returnError('invalidnumber'))
+
             params = Parameters()
-            params.add('N', value=3, vary=False)
-            params.add('norm', value=1e-3, min=1e-13, max=1e+3, vary=True) 
-            params.add('a1', value=2, min=0, max=6, vary=True)
-            params.add('a2', value=1, min=0, max=6, vary=True)
-            params.add('a3', value=2, min=0, max=6, vary=True)
-            params.add('a4', value=1, min=0, max=6, vary=True)
-            params.add('a5', value=0, vary=False)
-            params.add('b1', value=500, vary=True)
-            params.add('b2', value=1000, min=600, max=1300, vary=True)
-            params.add('b3', value=100000, min=50000, max=300000, vary=True)
-            params.add('b4', value=0, vary=False)
+            params.add('N', value=N, vary=False)
+
+            # ask for index/break parameters - N breaks, N+1 powerlaws
+            for i in range(6):
+                if i < N:
+                    params.add(f'b{i+1}', value=parameterInput(inp, f'break{i+1}'), min=0, max=1000000, vary=True)
+                else:
+                    params.add(f'b{i+1}', value=0, min=-1, max=1, vary=False)
+
+            for i in range(5):
+                if i < N+1:
+                    params.add(f'a{i+1}', value=parameterInput(inp, f'index{i+1}'), min=0, max=1000000, vary=True)
+                else:
+                    params.add(f'a{i+1}', value=0, min=-1, max=1, vary=False)
+
+            # ask user for norm
+            norm = parameterInput(inp, 'norm')
+            params.add('norm', value=norm, min=1e-13, max=1e+3, vary=True) 
             
             # perform fit and output results
             result = model.fit(ydata, params, x=xdata)
             print(result.fit_report())
-
-            # produce confidence intervals
-            # print(result.conf_interval(p_names=('a1','a2','a3')))
             
             # plot fits
-            # plt.plot(xdata, result.init_fit)
             plt.plot(xdata, result.best_fit)
             plt.show()
 
@@ -522,6 +534,12 @@ def removeData(data,start_index,decay_index):
         data_subset = unfilteredData
         return data_subset
 
+def parameterInput(model, input_text):
+    try:
+        return float(input(f'LAFF:{model}:{input_text} > '))
+    except:
+        return print(returnError('invalidnumber'))
+
 ########################################################
 # RUN MODEL HELP PROMPT
 ########################################################
@@ -564,3 +582,7 @@ class modelHelp(Cmd):
 # test
 laff().cmdloop()
 
+
+# change input for function
+# args: variable name and disply text
+# take input and convert to float, catching errors
