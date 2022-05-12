@@ -1,11 +1,20 @@
+from pyexpat import model
 from astropy.table import Table, vstack
 import matplotlib.pyplot as plt
-# only 2 imports
+from scipy.odr import ODR, Model, RealData
+import laffmodels
+import numpy as np
+from tabulate import tabulate
+
+import warnings
+warnings.filterwarnings("ignore")
 
 filepath = 'data/grb210112a.qdp' # data filepath
 riseRequirement = 2 # how much data should rise to flag as potential flare
 decayRequirement = 4 # variable affecting how easier it is to end decay
 showFlares = True # plot the flare data?
+showComponents = False # show the individual model components?
+showRatio = True # if not, show residuals
 
 #####################
 # USEFUL FUNCTIONS
@@ -38,6 +47,7 @@ data = data.reset_index(drop=True)
 data = data.rename(columns={'col1': 'time', 'col1_perr': 'time_perr', \
     'col1_nerr': 'time_nerr', 'col2': 'flux', 'col2_perr': 'flux_perr', \
     'col2_nerr': 'flux_nerr'})
+data['flare'] = False
 
 ###############################################################
 # IDENTIFY POTENTIAL FLARES
@@ -166,59 +176,234 @@ for end in possible_decay:
 index_decay = uniqueList(index_decay)
 
 ###############################################################
+# FLARE ASSIGNING
+###############################################################
+
+# assign flares to table
+for start, peak, decay in zip(index_start, index_peak, index_decay):
+    rise_start = data.index >= start
+    decay_end = data.index < decay
+    data['flare'][rise_start & decay_end] = True
+
+flares = data.flare == True
+
+###############################################################
+# POWERLAW FITTING
+###############################################################
+
+b1, b2, b3, b4, b5 = 189, 213, 1300, 5100, 150000 # grb 210112a
+a1, a2, a3, a4, a5, a6 = 1, 1, 1, 1, 1, 1
+norm = 1e-7
+
+# define data
+modeldata = RealData(data.time[~flares], data.flux[~flares], data.time_perr[~flares], data.flux_perr[~flares])
+
+###############################################################
+# 1 BREAKS
+
+model_1break = Model(laffmodels.powerlaw_1break)
+odr_1break = ODR(modeldata, model_1break, [b1, a1, a2, norm])
+odr_1break.set_job(fit_type=0)
+output_1break = odr_1break.run()
+
+if output_1break.info != 1:
+    i = 1
+    while output_1break.info != 1 and i < 100:
+        output_1break = odr_1break.restart()
+        i += 1
+
+###############################################################
+# 2 BREAKS
+
+model_2break = Model(laffmodels.powerlaw_2break)
+odr_2break = ODR(modeldata, model_2break, [b1, b2, a1, a2, a3, norm])
+odr_2break.set_job(fit_type=0)
+output_2break = odr_2break.run()
+
+if output_2break.info != 1:
+    i = 1
+    while output_2break.info != 1 and i < 100:
+        output_2break = odr_2break.restart()
+        i += 1
+
+###############################################################
+# 3 BREAKS
+
+model_3break = Model(laffmodels.powerlaw_3break)
+odr_3break = ODR(modeldata, model_3break, [b1, b2, b3, a1, a2, a3, a4, norm])
+odr_3break.set_job(fit_type=0)
+output_3break = odr_3break.run()
+
+if output_3break.info != 1:
+    i = 1
+    while output_3break.info != 1 and i < 100:
+        output_3break = odr_3break.restart()
+        i += 1
+
+###############################################################
+# 4 BREAKS
+
+model_4break = Model(laffmodels.powerlaw_4break)
+odr_4break = ODR(modeldata, model_4break, [b1, b2, b3, b4, a1, a2, a3, a4, a5, norm])
+odr_4break.set_job(fit_type=0)
+output_4break = odr_4break.run()
+
+if output_4break.info != 1:
+    i = 1
+    while output_4break.info != 1 and i < 100:
+        output_4break = odr_4break.restart()
+        i += 1
+
+###############################################################
+# 5 BREAKS
+
+model_5break = Model(laffmodels.powerlaw_5break)
+odr_5break = ODR(modeldata, model_5break, [a1, a2, a3, a4, a5, a6, b1, b2, b3, b4, b5, norm])
+odr_5break.set_job(fit_type=0)
+output_5break = odr_5break.run()
+
+if output_5break.info != 1:
+    i = 1
+    while output_5break.info != 1 and i < 100:
+        output_5break = odr_5break.restart()
+        i += 1
+
+
+
+# a range to plot the model across (so we don't have problems with gaps in the data)
+constant_range = np.logspace(1.7, 6, num=2000)
+
+# best fitting model
+bestFit_range = laffmodels.powerlaw_5break(output_5break.beta, constant_range)
+bestFit_model = laffmodels.powerlaw_5break(output_5break.beta, np.array(data.time))
+
+# residuals
+residuals = data.flux - bestFit_model
+modelsum = bestFit_model
+
+###############################################################
+# FLARE FITTING
+###############################################################
+
+flare_fits = []
+
+# for each flare, automatically fit a gaussian
+for start, peak, decay in zip(index_start, index_peak, index_decay):
+
+    flaredata = RealData(data.time[start:decay+1], residuals[start:decay+1], data.time_perr[start:decay+1], data.flux_perr[start:decay+1])
+
+    model_flare = Model(laffmodels.flare_gaussian)
+    odr_flare = ODR(flaredata, model_flare, [tableValue(data,peak,"flux"),tableValue(data,peak,"time"),tableValue(data,decay,"time")-tableValue(data,start,"time")])
+    odr_flare.set_job(fit_type=0)
+    output_flare = odr_flare.run()
+
+    if output_flare.info != 1:
+        i = 1
+        while output_flare.info != 1 and i < 100:
+            output_flare = odr_flare.restart()
+            i += 1
+
+    # append the fit information
+    flare_fits.append(output_flare.beta)
+
+    # and add to residuals and modelsum
+    residuals = residuals - laffmodels.flare_gaussian(output_flare.beta, np.array(data.time))
+    modelsum = modelsum + laffmodels.flare_gaussian(output_flare.beta, np.array(data.time))
+
+###############################################################
+# PRINTING
+###############################################################
+
+placeholder_breakno = 5
+
+print("LAFF COMPLETE")
+print("=====================================")
+print("POWERLAW")
+print("Number of breaks: ", placeholder_breakno)
+for param in output_5break.beta:
+    print(param)
+print("=====================================")
+# print the number of breaks found for best fit model
+# and the fit parameters
+
+# print how many flares found
+# and what times the start, peak and decay is
+# then print the fit for each flare
+
+
+ # print all params
+for param in output_5break.beta:
+    print(param)
+
+print("{:.2f}\t".format(tableValue(data,start,"time")),"{:.2f}\t".format(tableValue(data,peak,"time")),"{:.2f}".format(tableValue(data,decay,"time")))
+
+
+
+###############################################################
 # PLOTTING
 ###############################################################
 
-# print flare times to console
-print("START\t PEAK\t END")  
-for start, peak, decay in zip(index_start, index_peak, index_decay):
-    print("{:.2f}\t".format(tableValue(data,start,"time")),"{:.2f}\t".format(tableValue(data,peak,"time")),"{:.2f}".format(tableValue(data,decay,"time")))
-  
+fig = plt.figure()
+gs = fig.add_gridspec(2, hspace=0, height_ratios=[2, 1])
+axes = gs.subplots(sharex=True)
 
+# plot the main lightcurve
 if showFlares == True:
-    plt.errorbar(data.time, data.flux, xerr=[-data.time_nerr, data.time_perr], yerr=[-data.flux_nerr, data.flux_perr], \
-    marker='', linestyle='None', capsize=0 )
-
-    for start, peak, decay in zip(index_start, index_peak, index_decay):
-        rise_start  = data.index >= start
-        rise_end    = data.index <= peak
-        decay_start = data.index > peak
-        decay_end   = data.index <= decay
-        plt.axvspan(tableValue(data,start,"time"), tableValue(data,decay,"time"), color='grey', alpha=0.5)
-        plt.errorbar(data.time[rise_start & rise_end], data.flux[rise_start & rise_end], xerr=[-data.time_nerr[rise_start & rise_end], data.time_perr[rise_start & rise_end]], yerr=[-data.flux_nerr[rise_start & rise_end], data.flux_perr[rise_start & rise_end]], \
-        marker='', linestyle='None', capsize=0, color='green')
-        plt.errorbar(data.time[decay_start & decay_end], data.flux[decay_start & decay_end], xerr=[-data.time_nerr[decay_start & decay_end], data.time_perr[decay_start & decay_end]], yerr=[-data.flux_nerr[decay_start & decay_end], data.flux_perr[decay_start & decay_end]], \
+    axes[0].errorbar(data.time, data.flux, xerr=[-data.time_nerr, data.time_perr], yerr=[-data.flux_nerr, data.flux_perr], \
+        marker='', linestyle='None', capsize=0)
+    axes[0].errorbar(data.time[flares], data.flux[flares], xerr=[-data.time_nerr[flares], data.time_perr[flares]], yerr=[-data.flux_nerr[flares], data.flux_perr[flares]], \
         marker='', linestyle='None', capsize=0, color='red')
-    
 else:
-    for start, decay in zip(index_start, index_decay):
-        plt.axvspan(tableValue(data,start,"time"), tableValue(data,decay,"time"), color='grey', alpha=0.5)
+    axes[0].errorbar(data.time[~flares], data.flux[~flares], xerr=[-data.time_nerr[~flares], data.time_perr[~flares]], yerr=[-data.flux_nerr[~flares], data.flux_perr[~flares]], \
+        marker='', linestyle='None', capsize=0)
 
-    # remove flares from the full dataset
-    def removeData(data,start_index,decay_index):
-        unfilteredData = data
-        for start, decay in zip(start_index, decay_index):
-            unfilteredData = unfilteredData[~unfilteredData['time'].between(tableValue(data,start+1,"time"),tableValue(data,decay-1,"time"))]
-        data_subset = unfilteredData
-        return data_subset
+# plot the underlying model on the lightcurve
 
-    data = removeData(data,index_start,index_decay)
+for flare in flare_fits:
+    bestFit_range = bestFit_range + laffmodels.flare_gaussian(flare, constant_range)
+axes[0].plot(constant_range, bestFit_range)
 
-    plt.errorbar(data.time, data.flux, xerr=[-data.time_nerr, data.time_perr], yerr=[-data.flux_nerr, data.flux_perr], \
-    marker='', linestyle='None', capsize=0 )
-
-
-
+# ratio if true, residuals if not
+if showRatio == True:
+    axes[1].scatter(data.time, data.flux/modelsum, marker='.')
+    axes[1].axhline(y=1, color='r', linestyle='--')
+else:
+    axes[1].errorbar(data.time, residuals, xerr=[-data.time_nerr, data.time_perr], yerr=[-data.flux_nerr, data.flux_perr], \
+     marker='', linestyle='None', capsize=0)
 
 
+ # plot the underlying model components before addition
+if showComponents == True:
+    axes[0].plot(constant_range, laffmodels.powerlaw_5break(output_5break.beta, constant_range))
+    for flare in flare_fits:
+        axes[0].plot(constant_range, laffmodels.flare_gaussian(flare,constant_range))
 
+axes[0].set_ylim(1e-14, 1e-7)
+axes[0].loglog()
 
-
-
-plt.loglog()
 plt.show()
+
+
+
+
+# with the removed flare data
+# plot a simple powerlaw
+# then powerlaw with 1 break
+# ...
+# up to powerlaw with 5(?) breaks
+# evaluate each one
+# figure out which is the best fit
+
+
+
+
+
 
 # should i include the first and last point within the flares in the fitting?
 
 # be careful after removing flare data, it may cause errors when looking for certain positions
 # maybe i should keep a copy of the full dataset always so i can go back to it if neccesary?
+
+
+# make the lightcurve fitter a function and just run for each model?
+
