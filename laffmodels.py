@@ -1,7 +1,7 @@
 import numpy as np
 
 def powerlaw_1break(beta, x):
-    b1, a1, a2, norm = beta
+    a1, a2, b1, norm = beta
     funclist = [lambda x: norm * (x**(-a1)), \
                 lambda x: norm * (x**(-a2)) * (b1**(-a1+a2)) ]
     condlist = [x <= b1, \
@@ -9,7 +9,7 @@ def powerlaw_1break(beta, x):
     return np.piecewise(x, condlist, funclist)
 
 def powerlaw_2break(beta, x):
-    b1, b2, a1, a2, a3, norm = beta
+    a1, a2, a3, b1, b2, norm = beta
     funclist = [lambda x: norm * (x**(-a1)), \
                 lambda x: norm * (x**(-a2)) * (b1**(-a1+a2)), \
                 lambda x: norm * (x**(-a3)) * (b1**(-a1+a2)) * (b2**(-a2+a3))]
@@ -19,7 +19,7 @@ def powerlaw_2break(beta, x):
     return np.piecewise(x, condlist, funclist)
 
 def powerlaw_3break(beta, x):
-    b1, b2, b3, a1, a2, a3, a4, norm = beta
+    a1, a2, a3, a4, b1, b2, b3, norm = beta
     funclist = [lambda x: norm * (x**(-a1)), \
                 lambda x: norm * (x**(-a2)) * (b1**(-a1+a2)), \
                 lambda x: norm * (x**(-a3)) * (b1**(-a1+a2)) * (b2**(-a2+a3)), \
@@ -31,7 +31,7 @@ def powerlaw_3break(beta, x):
     return np.piecewise(x, condlist, funclist)
 
 def powerlaw_4break(beta, x):
-    b1, b2, b3, b4, a1, a2, a3, a4, a5, norm = beta
+    a1, a2, a3, a4, a5, b1, b2, b3, b4, norm = beta
     funclist = [lambda x: norm * (x**(-a1)), \
                 lambda x: norm * (x**(-a2)) * (b1**(-a1+a2)), \
                 lambda x: norm * (x**(-a3)) * (b1**(-a1+a2)) * (b2**(-a2+a3)), \
