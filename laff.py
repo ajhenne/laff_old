@@ -1,588 +1,450 @@
-from cmd import Cmd
-import matplotlib.pyplot as plt
-from numpy import True_
-from pytest import param
-import laffmodels
-from lmfit import Model, Parameters
-from lmfit.confidence import conf_interval
 from astropy.table import Table, vstack
-from textwrap import dedent
-import os
-import glob
+import matplotlib.pyplot as plt
+from regex import P
+from scipy.odr import ODR, Model, RealData
+import scipy.integrate as integrate
+import laffmodels
+import numpy as np
+# from tabulate import tabulate
 
-plt.ion()
+import warnings
+warnings.filterwarnings("ignore")
 
-########################################################
-# RUN LAFF PROMPT
-########################################################
+filepath = 'data/grb210112a.qdp' # data filepath
+riseRequirement = 2 # how much data should rise to flag as potential flare
+decayRequirement = 4 # variable affecting how easy it is to end decay
+showFlares = True # show the excluded flare data?
+showComponents = False # show the individual model components?
+showRatio = True # if not, show residuals
+showPlot = True # in case you just want output without plotting the result
 
-class laff(Cmd):
+#####################
+# USEFUL FUNCTIONS
+#####################
 
-    prompt = 'LAFF > '
-    intro="""\
-================================================================================
-Lightcurve and Flare Fitter (LAFF) -- last updated 13/12/2021
---------------------------------------------------------------------------------
-The function of this program is to read Swift XRT lightcurve files and identify
-potential flares. These can be ignored so that we can fit a model to the
-underlying lightcurve, and then fit a model to the flares themselves.
---------------------------------------------------------------------------------
-Type 'help' or '?' to list commands.
---------------------------------------------------------------------------------
-*KNOWN BUGS*
-- When using graphical commands, allow for the plot to finish updating before
-  typing another  command.
-- Don't click on/manipulate the plotting window.
-================================================================================\
-"""
-    # INITIALISING VARIABLES
-    
-    # data (and reduced data variable)
-    data         = None
-    data_plot    = None
-    data_fit     = None
-    startIndex   = None
-    peakIndex    = None
-    decayIndex   = None
-    currentModel = None
-    
-    # toggable plotting parameters
-    logScale     = True
-    showFlares   = True
+# returns the parameter value from the data
+def tableValue(input_data,index,column):
+    return input_data['%s' % column].iloc[index]
 
-    # toggable data parameters
-    useFlares          = True
-    detectionThreshold = 3
-
-    # alternate command names
-    cmd_data  = ('data', 'd', 'dt', 'da')
-    cmd_flare = ('flares', 'flare', 'fl', 'f')
-
-    def do_data(self, filepath):
-        self.data       = None
-        self.data_plot  = None
-        self.data_fit   = None
-        self.startIndex = None
-        self.peakIndex  = None
-        self.decayIndex = None
-
-        if filepath:
-            try:
-                table_one = Table.read('%s' % filepath, format='ascii.qdp', table_id=0)
-                table_two = Table.read('%s' % filepath, format='ascii.qdp', table_id=1)
-                table_tre = Table.read('%s' % filepath, format='ascii.qdp', table_id=2)
-                table_one['tableID'], table_two['tableID'], table_tre['tableID'] = 0, 1, 2
-
-                final_table = vstack([table_one, table_two, table_tre])
-                data = final_table.to_pandas()
-                data = data.sort_values(by=['col1'])
-                data = data.reset_index(drop=True)
-                self.data       = data
-                self.data_plot  = data
-                self.data_fit   = data
-                print("Successfully imported %s rows of data." % len(data.index))
-            except:
-                print(returnError('filepath'))
-        else:
-            print("Please provide a filepath. Use 'help data' for command usage.")
-
-    def complete_data(self, text, line, begidx, endidx):
-        before_arg = line.rfind(" ", 0, begidx)
-        if before_arg == -1:
-            return # arg not found
-
-        fixed = line[before_arg+1:begidx]  # fixed portion of the arg
-        arg = line[before_arg+1:endidx]
-        pattern = arg + '*'
-
-        completions = []
-        for path in glob.glob(pattern):
-            path = _append_slash_if_dir(path)
-            completions.append(path.replace(fixed, "", 1))
-        return completions
-
-    def help_data(self):
-        print(dedent("""\
-        data <filename>
-            Import your data, providing a valid filename or path to file. Current
-            supported filetypes are: Swift XRT .qdp files. Currently the user may only
-            load one set of data at a time."""))
-        
-    def do_flares(self, inp):
-        if self.data is None:
-            return print(returnError('nodata'))
-    
-        data = self.data
-        sigma = self.detectionThreshold
-        
-        ### detect possible flare deviations
-        possible_flare = []
-        for index in data.index[data.col1 < 2000]:
-            current       = tableValue(data,index,"flux")
-            current_error = tableValue(data,index,"flux_perr")
-            ahead_3       = tableValue(data,index+3,"flux")
-            ahead_4       = tableValue(data,index+4,"flux")
-            if ahead_3 > (current + sigma*current_error) and ahead_4 > (current + sigma*current_error):
-                # adjust = minimaFinder(data,index)
-                possible_flare.append(index)
-        possible_flare = uniqueList(possible_flare)
-
-        ### finding peak of flare
-        index_peak = []
-        for start in possible_flare:
-            values = []
-            for n in range(-4,50):
-                values.append([tableValue(data,start+n,"flux"),n])
-            index_peak.append(start+max(values)[1])
-        index_peak = uniqueList(index_peak)
-
-        ### adjust flare start, looking for local minima
-        # don't allow for minima to be found after peak
-        index_start = []
-        for toAdjust in possible_flare:
-            local_values = []
-            reachedPeak = False
-            for position in range(-20,20):
-                new_time = tableValue(data,toAdjust+position,"time")
-                if (toAdjust+position) >= 0:
-                    if (toAdjust+position) not in index_peak and reachedPeak == False and new_time < 2000:
-                        local_values.append([tableValue(data,toAdjust+position,"flux"),position])
-                    else:
-                        reachedPeak = True
-            adjusted_index = min(local_values)[1]
-            index_start.append(toAdjust + adjusted_index)
-        index_start = uniqueList(index_start)
-
-        # filter the list of peaks and minima
-        # peak must be greater than minima by X amount
-
-        ### look for when decay ends
-        index_decay = []
-
-        # calculate the a2 value, index from peak to N
-        def gradientPeak(data,c_index,peak):
-            deltaFlux = tableValue(data,c_index,"flux") - tableValue(data,peak,"flux")
-            deltaTime = tableValue(data,c_index,"time") - tableValue(data,peak,"time")
-            return deltaFlux/deltaTime
-        # calculate the a1 value, index from N+1 to N
-        def gradientNext(data,c_index):
-            deltaFlux = tableValue(data,c_index+1,"flux") - tableValue(data,c_index,"flux")
-            deltaTime = tableValue(data,c_index+1,"time") - tableValue(data,c_index,"time")
-            return deltaFlux/deltaTime
-
-        for peak in index_peak:
-            endDecay = False
-            N = peak
-            while endDecay == False:
-                current_time = tableValue(data,N,"time")
-                N += 1
-                next_time = tableValue(data,N,"time")
-
-                if current_time >= 2000:
-                    endDecay = True
-                if (N+1) in index_start:
-                    endDecay = True
-                if next_time - current_time > 1000:
-                    endDecay = True
-
-                gradient_compare = []
-                for i in range(10):
-                    a1 = gradientPeak(data,N+i,peak)
-                    a2 = gradientNext(data,N+i)
-                    gradient_compare.append([a1,a2])
-                condition = 0
-                prev_a1 = gradient_compare[0][0]
-                prev_a2 = gradient_compare[0][1]
-
-                for check in gradient_compare:
-                    if check[0] < check[1]:
-                        if check[0] > prev_a1 and check[1] > prev_a2:
-                            condition += 1
-                        else:
-                            if condition >= 0:
-                                condition -= 0.5
-                        prev_a1, prev_a2 = check[0], check[1]
-                if condition >= 4:
-                    N = N + 10
-                    endDecay = True
-            index_decay.append(N)
-        index_decay = uniqueList(index_decay)
-
-        ### output flare times
-        self.startIndex, self.peakIndex, self.decayIndex = index_start,index_peak,index_decay
-
-        ### print flare times
-        for start, peak, decay in zip(self.startIndex, self.peakIndex, self.decayIndex):
-            print("FLARE | start-time:",tableValue(self.data,start,"time"), \
-                    "| peak-time:",tableValue(self.data,peak,"time"), \
-                    "| end time:", tableValue(self.data,decay,"time") )
-
-    def help_flares(self):
-        print(dedent("""\
-        flares
-            Run an algorithm to search for possible flares in the lightcurve. It will
-            identify the start, peak and end times of flares which can then be plotted
-            or ignored."""))
-
-    def do_plot(self,inp):
-        if self.data is None:
-            return print(returnError('nodata'))
-
-        if inp in self.cmd_data:
-            if self.logScale == True:
-                plt.close()
-                plotLightcurve(self.data_plot, 'log')
-                plt.draw()
-            else:
-                plt.close()
-                plotLightcurve(self.data_plot, 'normal')
-                plt.draw()
-        elif inp in self.cmd_flare:
-            if self.decayIndex is None:
-                return print("Error: please run 'flares' command first.")
-            if self.logScale == True:
-                plt.close()
-                plotLightcurve(self.data_plot, 'log')
-                plotFlares(self.data, self.startIndex, self.decayIndex)
-                plt.draw()
-            else:
-                plt.close()
-                plotLightcurve(self.data_plot, 'normal')
-                plotFlares(self.data, self.startIndex, self.decayIndex)
-                plt.draw()
-        else:
-            print("Error: please provide a valid argument to plot. See 'help plot' for usage.")
-
-    def complete_plot(self, text, line, begidx, endidx):
-        plot_commands = ['data', 'flares']
-        if not text:
-            completions = plot_commands[:]
-        else:
-            completions = [ f
-                            for f in plot_commands
-                            if f.startswith(text)
-                            ]
-        return completions
-
-    def help_plot(self):
-        print(dedent("""\
-        plot <command>
-            data   / d      --- plots the currently loaded lightcurve
-            ldata  / ld     --- overrides log command to plot lightcurve on log scale
-            flares / fl     --- draws the designated flares regions on the lightcurve
-            ----------------------------------------------------------------------------
-            Use 'log' command to toggle log scale.
-            (Note: avoid drawing multiple plots in rapid succession)"""))
-
-    def do_log(self, inp):
-        self.logScale = not self.logScale
-        print("Log scale:",self.logScale)
-
-    def help_log(self):
-        print(dedent("""\
-        log 
-            Toggle whether data is plotted with a log scale."""))
-
-    def do_ignore(self,inp):
-        if inp in self.cmd_flare or inp == '':
-
-            if self.data is None:
-                return print(returnError('nodata'))
-            if self.startIndex is None:
-                return print(returnError('runflares'))
-
-            self.useFlares = not self.useFlares
-            if self.useFlares == False:
-                self.data_fit = removeData(self.data, self.startIndex, self.decayIndex)
-                print("Flares will be ignored in fitting")
-            else:
-                self.data_fit = self.data
-                print("Flares will be used in fitting")
-        
-        else:
-            print(returnError('invalidarg'))
-
-    def help_ignore(self):
-        print(dedent("""\
-        ignore <command>
-            flares          --- Toggle whether to ignore excluded data such as flares
-                                during modelling.
-            ----------------------------------------------------------------------------
-            Only affects fitting/analysis related functions. To simply not display the
-            data during plots, see the 'show' commmand."""))
-
-    def do_display(self,inp):
-        if inp in self.cmd_flare:
-
-            if self.data is None:
-                return print(returnError('nodata'))
-            if self.startIndex is None:
-                return print(returnError('runflares'))
-
-            self.showFlares = not self.showFlares
-            if self.showFlares == False:
-                self.data_plot = removeData(self.data, self.startIndex, self.decayIndex)
-                print("Plot flares: False")
-            else:
-                self.data_plot = self.data
-                print("Plot flares: True")    
-        else:
-            print(returnError('invalidarg'))
-    
-    def help_display(self):
-        print(dedent("""\
-        display <command>
-            flares          --- Toggle whether to display excluded data such as flares
-                                during plotting.
-            ----------------------------------------------------------------------------
-            Only affects plotting related commands. To exclude the data during modelling
-            functions, see the 'ignore' command."""))
-
-    def do_model(self,inp):
-        if self.data is None:
-            return print(returnError('nodata'))
-
-        self.currentModel = None
-        data = self.data_fit
-        xdata = data['col1'].values
-        ydata = data['col2'].values
-
-        if inp == 'simplepowerlaw':
-            model = Model(laffmodels.powerlaw_simple)
-
-            alph = parameterInput(inp,'index')
-            norm = parameterInput(inp,'norm')
-
-            params = Parameters()
-            params.add('alph', value=alph, min=-5, max=5, vary=True)
-            params.add('norm', value=norm, min=1e-32, max=1e+32, vary=True)
-
-            result = model.fit(ydata, params, x=xdata)
-            print(result.fit_report())
-
-            plt.plot(xdata, result.best_fit)
-            plt.show()
-
-        if inp == 'powerlaw':
-            model = Model(laffmodels.powerlaw_general)
-            
-            # ask user for number of powerlaw breaks
-            try:
-                N = int(input('LAFF:powerlaw:breaks > '))
-            except:
-                print(returnError('invalidnumber'))
-
-            params = Parameters()
-            params.add('N', value=N, vary=False)
-
-            # ask for index/break parameters - N breaks, N+1 powerlaws
-            for i in range(6):
-                if i < N:
-                    params.add(f'b{i+1}', value=parameterInput(inp, f'break{i+1}'), min=0, max=1000000, vary=True)
-                else:
-                    params.add(f'b{i+1}', value=0, min=-1, max=1, vary=False)
-
-            for i in range(5):
-                if i < N+1:
-                    params.add(f'a{i+1}', value=parameterInput(inp, f'index{i+1}'), min=0, max=1000000, vary=True)
-                else:
-                    params.add(f'a{i+1}', value=0, min=-1, max=1, vary=False)
-
-            # ask user for norm
-            norm = parameterInput(inp, 'norm')
-            params.add('norm', value=norm, min=1e-13, max=1e+3, vary=True) 
-            
-            # perform fit and output results
-            result = model.fit(ydata, params, x=xdata)
-            print(result.fit_report())
-            
-            # plot fits
-            plt.plot(xdata, result.best_fit)
-            plt.show()
-
-    def complete_model(self,text,line,begidx,endidx):
-        model_commands = ['powerlaw', 'simplepowerlaw']
-        if not text:
-            completions = model_commands[:]
-        else:
-            completions = [ f
-                            for f in model_commands
-                            if f.startswith(text)
-                            ]  
-                            
-        return completions
-
-    def help_model(self):
-        modelHelper = modelHelp()
-        modelHelper.cmdloop()
-
-    def do_threshold(self,inp):
-        print("inp is :",inp)
-        try:
-            self.detectionThreshold = float(inp)
-            print("changing")
-        except:
-            print(returnError('invalidnumber'))
-    
-    def help_threshold(self):
-                    print(dedent("""\
-                    threshold
-                        Change the detection threshold in the 'flares' detection algorithm. Input number
-                        represents the number of error bars required for subsequent bins to see if there
-                        is a flare. See documentation on detection algorithm for further details."""))
-
-# DEFAULT COMMANDS
-
-    def do_shell(self, shellcommand):
-        """! <shell command>\n\tRun a shell command, accepts 'shell' or '!'."""
-        os.system(shellcommand)
-
-    def do_quit(self, inp):
-        """Exit the LAFF application."""
-        print("Exiting the LAFF application.")
-        return True
-
-    def default(self, inp):
-        if inp == 'q' or inp == 'exit':
-            return self.do_quit(inp)
-        else:
-            print("'%s' is not a valid command. Type 'help' for a list of commands." % inp)
-
-    def emptyline(self):
-        pass
-
-    do_EOF = do_quit
-
-########################################################
-# GENERAL FUNCTIONS
-########################################################
-
-# part of filepath autocompletion
-def _append_slash_if_dir(p):
-    if p and os.path.isdir(p) and p[-1] != os.sep:
-        return p + os.sep
-    else:
-        return p
-
-# remove duplicate values from list
+# take a list and remove all duplicates
 def uniqueList(duplicate_list):
     unique_list = list(set(duplicate_list))
     unique_list.sort()
     return unique_list
 
-# returns the parameter value from the datatable
-def tableValue(input_data,index,column):
-    if column == "time":
-        return input_data.iloc[index].col1
-    if column == "flux":
-        return input_data.iloc[index].col2
-    if column == "flux_perr":
-        return input_data.iloc[index].col2_perr
-    if column == "flux_nerr":
-        return input_data.iloc[index].col2_nerr
-    if column == "time_perr":
-        return input_data.iloc[index].col1_perr
-    if column == "time_nerr":
-        return input_data.iloc[index].col1_nerr
+# function to apply the ODR fitter
+def modelFit(datapoints,laffmodel,inputpar):
+    model = Model(laffmodel)
+    odr = ODR(datapoints, model, inputpar)
+    odr.set_job(fit_type=0)
+    output = odr.run()
 
-# print error statements
-def returnError(errortype):
-    if errortype == 'nodata':
-        return "Error: no valid dataset loaded. Please run data command."
-    if errortype == 'filepath':
-        return "Error: invalid filepath. Ensure path and file extension are correct."
-    if errortype == 'runflares':
-        return "Error: run 'flares' command first."
-    if errortype == 'invalidnumber':
-        return "Error: invalid number."
-    if errortype == 'invalidarg':
-        return "Error: invalid argument. See help <command> for usage."
+    if output.info != 1:
+        i =1
+        while output.info != 1 and i < 100:
+            output = odr.restart()
+            i += 1
+    return output, output.beta
 
-# plot the main lightcurve, grouping different viewing modes
-def plotLightcurve(data,scale):
-    groups = data.groupby('tableID')
-    for name, group in groups:
-        if name == 0:
-            plot_color = 'c'
-        if name == 1:
-            plot_color = 'b'
-        if name == 2:
-            plot_color = 'r'
-        plt.errorbar(group.col1, group.col2, xerr=[-group.col1_nerr,group.col1_perr], yerr=[-group.col2_nerr,group.col2_perr], \
-            marker='', linestyle='None', capsize=0, c=plot_color)
-    plt.legend(["WT slew mode","WT mode","PC mode"])
-    plt.ylabel("Flux (0.3-10 keV) (erg/cm$^{2}$/s)")
-    plt.xlabel("Time since BAT trigger (s)")
-    if scale == 'log':
-        plt.loglog()
-    if scale == 'normal':
-        plt.semilogy()
+###############################################################
+# LOAD DATA
+###############################################################
 
-# plot the flare regions, highlighted in red
-def plotFlares(data,start_index,decay_index):
-    for start, end in zip(start_index, decay_index):
-        minval = tableValue(data,start,"time")
-        maxval = tableValue(data,end,"time")
-        plt.axvspan(minval, maxval, alpha=0.5, color='r')
+# load data by table id (.qdp files are split between observation types)
+table_0 = Table.read(filepath, format='ascii.qdp', table_id=0)
+table_1 = Table.read(filepath, format='ascii.qdp', table_id=1)
+table_2 = Table.read(filepath, format='ascii.qdp', table_id=2)
+table_0['tableID'], table_1['tableID'], table_2['tableID'] = 0, 1, 2
 
-# filter a set of data
-def removeData(data,start_index,decay_index):
-        # data_subset = data
-        unfilteredData = data
-        for start, decay in zip(start_index, decay_index):
-            unfilteredData = unfilteredData[~unfilteredData['col1'].between(tableValue(data,start,"time"),tableValue(data,decay,"time"))]
-        data_subset = unfilteredData
-        return data_subset
+# combine tables, sort by time and reset indexes
+data = vstack([table_0, table_1, table_2]).to_pandas()
+data = data.sort_values(by=['col1'])
+data = data.reset_index(drop=True)
+data = data.rename(columns={'col1': 'time', 'col1_perr': 'time_perr', \
+    'col1_nerr': 'time_nerr', 'col2': 'flux', 'col2_perr': 'flux_perr', \
+    'col2_nerr': 'flux_nerr'})
+data['flare'] = False
 
-def parameterInput(model, input_text):
-    try:
-        return float(input(f'LAFF:{model}:{input_text} > '))
-    except:
-        return print(returnError('invalidnumber'))
+###############################################################
+# IDENTIFY POTENTIAL FLARES
+###############################################################
 
-########################################################
-# RUN MODEL HELP PROMPT
-########################################################
-
-class modelHelp(Cmd):
-    prompt = 'LAFF:ModelHelp > '
-
-    intro="""\
-        Type the name of a model for more details.
-
-        List of available models:
-        
-        powerlaw, simplepowerlaw, zzz, aa\
-        """
-    def default(self,inp):
-        if inp == 'q' or inp == 'exit':
-            return self.do_quit(inp)
-        elif inp == 'powerlaw':
-            print('here')
-        elif inp == 'simplepowerlaw':
-            print('simplepowerlaw')
-        elif inp == 'zzz':
-            print('zz')
-        elif inp == 'aaa':
-            print('aa')
-        else:
-            print('model not recognised. type help for list or something')
-    ### 
-
-    def do_quit(self, inp):
-        """Exit the LAFF application."""
-        print("Exiting the LAFF application.")
+# look through the next few flux values and see if they generally increase
+def flareFinder(data,index):
+    ahead = []
+    for i in range(8):
+        try:
+            ahead.append(tableValue(data,index+i,"flux"))
+        except:
+            pass
+    counter = 0
+    for check in ahead:
+        if tableValue(data,index,"flux") + (tableValue(data,index,"flux_perr")*riseRequirement) < check:
+            counter += 1
+    if counter >= 6:
         return True
+    else:
+        counter = 0
+        return False
 
-    def emptyline(self):
-        pass
+possible_flares = []
 
-    do_EOF = do_quit
+# if enough increase, mark as a possible flare
+for index in data.index[data.time < 2000]:
+    if flareFinder(data,index) == True:
+        possible_flares.append(index)
 
-# test
-laff().cmdloop()
+possible_flares = uniqueList(possible_flares)
+
+###############################################################
+# REFINE FLARE START POSITION
+###############################################################
+
+index_start = []
+
+# for each possible peak, look for a nearby minima as the flare start
+for peak in possible_flares:
+    values_start = []
+    for n in range(-10, 1):
+        if (peak+n) >= 0:
+            values_start.append([tableValue(data,peak+n,"flux"),n])
+    toAdjust = min(values_start)[1]
+    index_start.append(peak + toAdjust)
+
+index_start = uniqueList(index_start)
+
+###############################################################
+# FIND FLARE PEAK
+###############################################################
+
+index_peak = []
+
+# for each start, filter through next values looking for the peak
+for start in index_start:
+    values_peak = []
+    for n in range(0,50):
+        values_peak.append([tableValue(data,start+n,"flux"),n])
+    toAdjust = max(values_peak)[1]
+    index_peak.append(start+toAdjust)
+
+index_peak = uniqueList(index_peak)
+
+###############################################################
+# FIND DECAY END
+###############################################################
+
+possible_decay = []
+
+# if gradient is increasing mark this as end of decay
+for peak in index_peak:
+    i = peak
+    endDecay = False
+    while endDecay == False:
+
+        def grad_Peak(data,iter,peak):
+            delta_flux = tableValue(data,iter,"flux") - tableValue(data,peak,"flux")
+            delta_time = tableValue(data,iter,"time") - tableValue(data,peak,"time")
+            return delta_flux/delta_time
+
+        def grad_Next(data,iter):
+            delta_flux = tableValue(data,iter+1,"flux") - tableValue(data,iter,"flux")
+            delta_time = tableValue(data,iter+1,"time") - tableValue(data,iter,"time")
+            return delta_flux/delta_time
+
+        i += 1
+        condition = 0
+
+        for interval in data.index[(i):(i+10)]:
+            current_Peak = grad_Peak(data,interval,peak)
+            current_Next = grad_Next(data,interval)
+
+            if endDecay == False:
+                if (tableValue(data,interval,"time") > 2000) or (interval in index_start):
+                    possible_decay.append(interval-1)
+                    endDecay = True
+
+            if endDecay == False:
+                if current_Peak < current_Next:
+                    if current_Peak > grad_Peak(data,interval-1, peak) and current_Next > grad_Next(data,interval-1):
+                        condition += 1
+                if condition > decayRequirement:
+                    possible_decay.append(interval)
+                    endDecay = True
+
+possible_decay = uniqueList(possible_decay)
+
+###############################################################
+# REFINE DECAY END POSITION
+###############################################################
+
+index_decay = []
+
+# 
+for end in possible_decay:
+    values_end = []
+    n = 0
+    while (end+n) not in index_peak:
+        values_end.append([tableValue(data,end+n,"flux"),n])
+        n += -1
+    toAdjustDecay = min(values_end)[1]
+    index_decay.append(end + toAdjustDecay)
+
+index_decay = uniqueList(index_decay)
+
+###############################################################
+# FLARE ASSIGNING
+###############################################################
+
+# package the flare data nicely
+flareIndexes = []
+for start, peak, decay in zip(index_start, index_peak, index_decay):
+    flareIndexes.append([start,peak,decay])
+flareIndexes = flareIndexes[0:-1] # temporarily remove the last flare
 
 
-# change input for function
-# args: variable name and disply text
-# take input and convert to float, catching errors
+# assign flares to table
+for start, peak, decay in flareIndexes:
+    rise_start = data.index >= start
+    decay_end = data.index < decay
+    data['flare'][rise_start & decay_end] = True
+
+flares = data.flare == True
+
+###############################################################
+# POWERLAW FITTING
+###############################################################
+
+# define data
+data_noflare = RealData(data.time[~flares], data.flux[~flares], data.time_perr[~flares], data.flux_perr[~flares])
+
+# visually estimate the breaks
+b1, b2, b3, b4, b5 = 120, 200, 630, 9500, 120000
+a1, a2, a3, a4, a5, a6 = 1, 1, 1, 1, 1, 1
+norm = 1e-7
+
+# fit through 5 breaks
+brk1_fit, brk1_param = modelFit(data_noflare, laffmodels.powerlaw_1break, [a1, a2, b1, norm])
+brk2_fit, brk2_param = modelFit(data_noflare, laffmodels.powerlaw_2break, [a1, a2, a3, b1, b2, norm])
+brk3_fit, brk3_param = modelFit(data_noflare, laffmodels.powerlaw_3break, [a1, a2, a3, a4, b2, b3, b4, norm])
+brk4_fit, brk4_param = modelFit(data_noflare, laffmodels.powerlaw_4break, [a1, a2, a3, a4, a5, b2, b3, b4, b5, norm])
+brk5_fit, brk5_param = modelFit(data_noflare, laffmodels.powerlaw_5break, [a1, a2, a3, a4, a5, a6, b1, b2, b3, b4, b5, norm])
+
+# determine the best fit - WIP
+bknpower_model = laffmodels.powerlaw_4break
+bknpower_param = brk4_param
+
+residuals = data.flux - bknpower_model(bknpower_param, np.array(data.time))
+
+###############################################################
+# FLARE FITTING
+###############################################################
+
+flareFits = []
+
+# fit the flares
+for start, peak, decay in flareIndexes:
+    data_flare = RealData(data.time[start:decay+1], residuals[start:decay+1], data.time_perr[start:decay+1], data.flux_perr[start:decay+1])
+    flare_fit, flare_param = modelFit(data_flare, laffmodels.flare_gaussian, [tableValue(data,peak,"flux"), tableValue(data,peak,"time"),tableValue(data,decay,"time")-tableValue(data,start,"time")])
+    flareFits.append(flare_param)
+
+###############################################################
+# TOTAL MODEL FIT
+###############################################################
+
+# function that defines the whole model
+def prepareOverallModel(mod_powerlaw, params_powerlaw, mod_flares, params_flares):
+
+    model_components = mod_powerlaw, mod_flares, len(params_flares)
+
+    model_params = []
+    
+    for item in params_powerlaw:
+        model_params.append(item)
+
+    for item2 in params_flares:
+        for item in item2:
+            model_params.append(item)
+
+    return model_components, model_params
+
+model_components, model_params = prepareOverallModel(bknpower_model, bknpower_param, laffmodels.flare_gaussian, flareFits)
+
+
+# def finalModel(beta, x):
+#     model_params = []
+#     for woo in beta:
+#         for poo in woo:
+#             model_params.append(poo)
+
+#     return print(*model_params)
+
+def finalModel(beta, x):
+
+    possibleModels = laffmodels.powerlaw_1break, laffmodels.powerlaw_2break, laffmodels.powerlaw_3break, laffmodels.powerlaw_4break, laffmodels.powerlaw_5break
+
+    powerlawmodel = model_components[0]
+    flaremodel = laffmodels.flare_gaussian
+    flarecount = model_components[2]
+    powerlawcompcount = len(beta) - (3*flarecount)
+
+    totalModel = powerlawmodel(beta[0:powerlawcompcount], x) + flaremodel(beta[powerlawcompcount:powerlawcompcount+3],x)
+
+    return totalModel
+    # print(beta)
+
+# totalmodel = lambda x : the funcrion
+# then fit this function
+
+modelmodelmodel = finalModel(model_params, np.array(data.time))
+
+###############################################################
+# STATISTICS
+###############################################################
+
+# final model adjusted to data
+finalModel = bknpower_model(bknpower_param, np.array(data.time))
+for flare in flareFits:
+    finalModel += laffmodels.flare_gaussian(flare, np.array(data.time))
+
+# final model across a range
+constant_range = np.logspace(1.7,6, num=2000)
+finalRange = bknpower_model(bknpower_param, constant_range)
+for flare in flareFits:
+    finalRange += laffmodels.flare_gaussian(flare, constant_range)
+
+
+# R^2 statistic
+ss_res = np.sum((data.flux - finalModel) ** 2)
+ss_tot = np.sum((data.flux - np.mean(data.flux)) ** 2)
+r2 = 1 - (ss_res/ss_tot)
+
+# chi-square statistic
+chi2 = np.sum(((data.flux - finalModel) ** 2)/(data.flux_perr**2))
+dof = len(data.time) - len(bknpower_param) - (3 * 3)
+
+# calculate residual (ratio not additive)
+ratiores = np.sum(data.flux/finalModel)
+
+###############################################################
+# FLUENCE
+###############################################################
+
+# fluence - whole model
+x = constant_range
+
+func_powerlaw = lambda x: bknpower_model(bknpower_param, x)
+
+func_flare = []
+
+def createFinalFlare(flarefits):
+    return lambda x: laffmodels.flare_gaussian(flarefits, x)
+
+for flare in flareFits:
+    func_flare.append(createFinalFlare(flare))
+
+def calculateFluence(powerlaw_func, flare_funclist, start, stop):
+    comp_powerlaw = integrate.quad(powerlaw_func, start, stop)[0]
+    comp_flares = [integrate.quad(flare, start, stop)[0] for flare in flare_funclist]
+    tot = comp_powerlaw + np.sum(comp_flares)
+    
+    return comp_powerlaw, comp_flares, tot
+
+###############################################################
+# PRINTING
+###############################################################
+doPrint = True
+
+N = len(bknpower_param)
+def printLine():
+    print("==============================================")
+
+if doPrint == True:
+    printLine()
+    print("LAFF")
+
+    # print powerlaw parameters
+    printLine()
+    N = len(bknpower_param)
+    print("Powerlaw Params")
+    print("Indices >", [round(params, 2) for params in bknpower_param[0:int(N/2)]])
+    print("Breaks\t>", [round(params, 2) for params in bknpower_param[int(N/2):int(N-1)]])
+    print("Norm\t>", [float("{:.2e}".format(bknpower_param[-1]))])
+
+    count = 0
+    # print flare times
+    printLine()
+    print("Flare Times (start, peak, end)")
+    for count, (start, peak, decay) in enumerate(flareIndexes, start=1):
+        print("Flare",count,">",[round(tableValue(data,start,"time"),2), round(tableValue(data,peak,"time"),2), round(tableValue(data,decay,"time"),2)])
+
+    # print statistics
+    printLine()
+    print("Statistics")
+    print("R^2\t\t\t>",round(r2,2))
+    print("Chi-square\t\t>",round(chi2,2),"for",dof, "dof")
+    print("Reduced chi-square\t>",round(chi2/dof,3))
+    print("Data/model residuals\t>",round(ratiores,2))
+
+    printLine()
+
+    print("Fluence")
+
+    print('---')
+    print("Full range")
+    val = calculateFluence(func_powerlaw, func_flare, tableValue(data,0,"time"), tableValue(data,-1,"time"))
+    print("Powerlaw >", val[0])
+    print("Gaussian >", *[(str(x)+"\n\t  ") for x in list(val[1][:-1])],val[1][-1])
+    print("Total\t >", val[2])
+    
+    count = 0
+    for count, (start, peak, decay) in enumerate(flareIndexes, start=1):
+        print('---')
+        print("Flare",count)
+        val = calculateFluence(func_powerlaw, func_flare, tableValue(data,start,"time"), tableValue(data,decay,"time"))
+        print("Powerlaw >", val[0])
+        print("Gaussian >", *[(str(x)+"\n\t  ") for x in list(val[1][:-1])],val[1][-1])
+        print("Total\t >", val[2])
+
+    printLine()
+
+###############################################################
+# PLOTTING
+###############################################################
+
+fig = plt.figure()
+gs = fig.add_gridspec(2, hspace=0, height_ratios=[2, 1])
+axes = gs.subplots(sharex=True)
+
+# plot the lightcurve data
+axes[0].errorbar(data.time, data.flux, xerr=[-data.time_nerr, data.time_perr], yerr=[-data.flux_nerr, data.flux_perr], \
+    marker='', linestyle='None', capsize=0)
+axes[0].errorbar(data.time[flares], data.flux[flares], xerr=[-data.time_nerr[flares], data.time_perr[flares]], yerr=[-data.flux_nerr[flares], data.flux_perr[flares]], \
+        marker='', linestyle='None', capsize=0, color='red')
+
+# plot the model
+axes[0].plot(constant_range, finalRange)
+
+# plot data/model ratio
+axes[1].scatter(data.time, data.flux/finalModel, marker='.')
+axes[1].axhline(y=1, color='r', linestyle='--')
+
+# plot the underlying components
+# axes[0].plot(constant_range, bknpower_model(bknpower_param, constant_range))
+# for flare in flareFits:
+#     axes[0].plot(constant_range, laffmodels.flare_gaussian(flare, constant_range), linestyle='--', linewidth=0.5)
+
+# plot vertical lines at powerlaw breaks
+for broken in bknpower_param[int(N/2):int(N-1)]:
+    axes[0].axvline(broken, color='darkgrey', linestyle='--', linewidth=0.5)
+
+# axes[0].scatter(data.time, modelmodelmodel, marker='X')
+
+# plot properties
+axes[0].loglog()
+# axes[0].set_ylim(1e-14, 1e-7)
+axes[0].set_ylabel("Observed Flux Density (Jy)")
+axes[1].set_ylabel("Ratio")
+axes[1].set_xlabel("Time since BAT Trigger (s)")
+
+if showPlot == True:
+    plt.show()

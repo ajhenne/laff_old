@@ -42,10 +42,12 @@ def powerlaw_4break(beta, x):
                 np.logical_and(x > b2, x <= b3), \
                 np.logical_and(x > b3, x <= b4), \
                 x > b4]
+
     return np.piecewise(x, condlist, funclist)
 
 def powerlaw_5break(beta, x):
     a1, a2, a3, a4, a5, a6, b1, b2, b3, b4, b5, norm = beta
+
     funclist = [lambda x: norm * (x**(-a1)), \
                 lambda x: norm * (x**(-a2)) * (b1**(-a1+a2)), \
                 lambda x: norm * (x**(-a3)) * (b1**(-a1+a2)) * (b2**(-a2+a3)), \
